@@ -14,11 +14,11 @@ class Settings(BaseSettings):
     DEBUG: bool = False
 
     # ── LLM ──────────────────────────────────────────────────────────────────
-    # Primary: Gemini 2.5 Flash (also known internally as gemini-3.8-flash)
+    # Primary: gemini-3.8-flash (recommended by Google AI Studio)
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_MODEL: str = "gemini-3.8-flash"
     THINKING_LEVEL: str = "medium"           # none | low | medium | high
-    FALLBACK_MODEL: str = "gemini-2.0-flash"
+    FALLBACK_MODEL: str = "gemini-2.5-flash"
 
     # ── Scraping ─────────────────────────────────────────────────────────────
     REQUEST_TIMEOUT: float = 25.0            # total per-hop timeout (seconds)

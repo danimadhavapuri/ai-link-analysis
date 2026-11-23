@@ -120,54 +120,57 @@ class LLMService:
             data = self._heuristic(content, competitor_signals)
             return data, "grounded-heuristic-engine", est_in, 950
 
-        models = [self.cfg.GEMINI_MODEL, self.cfg.FALLBACK_MODEL]
+        models = [self.cfg.GEMINI_MODEL, "gemini-3.8-flash", "gemini-2.5-flash"]
+        unique_models = list(dict.fromkeys(models))
         last_exc: Exception | None = None
 
-        for model in models:
-            try:
-                from google.genai import types
+        for model in unique_models:
+            for use_thinking in [True, False]:
+                try:
+                    from google.genai import types
 
-                # Build thinking config based on THINKING_LEVEL setting
-                thinking_level = self.cfg.THINKING_LEVEL.lower()
-                thinking_config = None
-                if thinking_level == "none":
-                    thinking_config = types.ThinkingConfig(thinking_budget=0)
-                elif thinking_level == "low":
-                    thinking_config = types.ThinkingConfig(thinking_budget=1024)
-                elif thinking_level == "medium":
-                    thinking_config = types.ThinkingConfig(thinking_budget=8192)
-                elif thinking_level == "high":
-                    thinking_config = types.ThinkingConfig(thinking_budget=24576)
+                    config_kwargs = dict(
+                        system_instruction=_SYSTEM,
+                        response_mime_type="application/json",
+                        response_schema=AnalysisData,
+                        temperature=0.2,
+                    )
 
-                config_kwargs = dict(
-                    system_instruction=_SYSTEM,
-                    response_mime_type="application/json",
-                    response_schema=AnalysisData,
-                    temperature=0.2,
-                )
-                if thinking_config is not None:
-                    config_kwargs["thinking_config"] = thinking_config
+                    if use_thinking and hasattr(types, "ThinkingConfig"):
+                        thinking_level = self.cfg.THINKING_LEVEL.lower()
+                        if thinking_level == "none":
+                            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+                        elif thinking_level == "low":
+                            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=1024)
+                        elif thinking_level == "medium":
+                            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=8192)
+                        elif thinking_level == "high":
+                            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=24576)
 
-                resp = self._client.models.generate_content(
-                    model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(**config_kwargs),
-                )
+                    resp = self._client.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(**config_kwargs),
+                    )
 
-                text = resp.text
-                if not text:
-                    raise LLMServiceError(f"Model '{model}' returned empty response.")
+                    text = resp.text
+                    if not text:
+                        continue
 
-                data = AnalysisData.model_validate(json.loads(text))
-                return data, model, est_in, len(text) // 4
+                    data = AnalysisData.model_validate(json.loads(text))
+                    return data, model, est_in, len(text) // 4
 
-            except LLMServiceError:
-                raise
-            except Exception as exc:
-                logger.warning("Model '%s' failed: %s", model, exc)
-                last_exc = exc
+                except LLMServiceError:
+                    raise
+                except Exception as exc:
+                    logger.warning("Model '%s' (thinking=%s) failed: %s", model, use_thinking, exc)
+                    last_exc = exc
+                    if not use_thinking:
+                        break
 
-        raise LLMServiceError(f"All LLM models failed. Last error: {last_exc}")
+        logger.error("All LLM models failed (%s). Falling back to grounded heuristic engine.", last_exc)
+        data = self._heuristic(content, competitor_signals)
+        return data, "grounded-heuristic-engine", est_in, 950
 
     # ── Heuristic (offline) engine ────────────────────────────────────────────
 

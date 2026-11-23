@@ -208,8 +208,9 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 # Endpoints
 # -----------------------------------------------------------------------------
 
-@app.get(
+@app.api_route(
     "/health",
+    methods=["GET", "HEAD"],
     summary="Health Check",
     tags=["Health"],
     response_description="System status",
@@ -225,8 +226,9 @@ async def health_check():
     }
 
 
-@app.get(
+@app.api_route(
     "/",
+    methods=["GET", "HEAD"],
     summary="Root API Info",
     tags=["Root"],
 )
