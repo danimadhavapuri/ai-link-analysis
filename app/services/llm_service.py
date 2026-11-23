@@ -120,7 +120,13 @@ class LLMService:
             data = self._heuristic(content, competitor_signals)
             return data, "grounded-heuristic-engine", est_in, 950
 
-        models = [self.cfg.GEMINI_MODEL, "gemini-3.8-flash", "gemini-2.5-flash"]
+        models = [
+            self.cfg.GEMINI_MODEL,
+            "gemini-3.5-flash",
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.1-flash-lite",
+        ]
         unique_models = list(dict.fromkeys(models))
         last_exc: Exception | None = None
 
