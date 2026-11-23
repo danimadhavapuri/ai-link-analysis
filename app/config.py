@@ -1,12 +1,11 @@
+"""Application configuration — loaded from environment variables / .env file."""
 from functools import lru_cache
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Application configuration loaded from environment variables."""
-
-    # Server Settings
+    # ── Service ──────────────────────────────────────────────────────────────
     APP_NAME: str = "AI-Powered Website Link Analysis API"
     APP_VERSION: str = "1.0.0"
     HOST: str = "0.0.0.0"
@@ -14,28 +13,29 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     DEBUG: bool = False
 
-    # LLM Settings
+    # ── LLM ──────────────────────────────────────────────────────────────────
+    # Primary: Gemini 2.5 Flash (also known internally as gemini-3.8-flash)
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash"
+    THINKING_LEVEL: str = "medium"           # none | low | medium | high
     FALLBACK_MODEL: str = "gemini-2.0-flash"
 
-    # Website Extraction Settings
-    REQUEST_TIMEOUT: float = 15.0
+    # ── Scraping ─────────────────────────────────────────────────────────────
+    REQUEST_TIMEOUT: float = 25.0            # total per-hop timeout (seconds)
+    REQUEST_CONNECT_TIMEOUT: float = 8.0
+    REQUEST_READ_TIMEOUT: float = 20.0
     MAX_REDIRECTS: int = 5
-    MAX_CONTENT_LENGTH: int = 15000  # Token optimization: trim cleaned content
+    MAX_CONTENT_CHARS: int = 15_000          # chars sent to LLM (token budget)
     USER_AGENT: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 "
-        "(compatible; LinkAnalysisBot/1.0)"
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
     )
 
-    # In-Memory Cache Settings (Cost & latency optimization)
+    # ── Cache ─────────────────────────────────────────────────────────────────
     CACHE_ENABLED: bool = True
     CACHE_TTL_SECONDS: int = 3600
     CACHE_MAX_ITEMS: int = 256
-
-    # Allowed URL schemes
-    ALLOWED_SCHEMES: List[str] = ["http", "https"]
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -46,5 +46,4 @@ class Settings(BaseSettings):
 
 @lru_cache()
 def get_settings() -> Settings:
-    """Return a cached singleton instance of Settings."""
     return Settings()

@@ -1,178 +1,168 @@
+"""
+SSRF-safe URL validator.
+
+Defence layers:
+  1. Scheme whitelist (http / https only)
+  2. Hostname blocklist (localhost, .local, .internal, cloud-metadata)
+  3. Direct-IP check via ipaddress — covers private/loopback/link-local/reserved
+  4. NAT64 (64:ff9b::/96) and IPv4-mapped (::ffff:0:0/96) — unwrap and re-check
+  5. DNS resolution → check every resolved address
+"""
 import ipaddress
 import socket
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 from urllib.parse import urlsplit
 
 
+# ── Custom exceptions ─────────────────────────────────────────────────────────
+
 class URLValidationError(Exception):
-    """Raised when a URL is syntactically invalid or unsupported."""
-    pass
+    """Bad URL structure or unsupported scheme."""
 
 
 class SSRFValidationError(URLValidationError):
-    """Raised when a URL targets a private, loopback, or cloud metadata address."""
-    pass
+    """URL resolves to a private / internal / cloud-metadata address."""
 
 
-# Specific cloud metadata and non-routable IP networks to explicitly block
-BLOCKED_IP_NETWORKS = [
-    ipaddress.ip_network("0.0.0.0/8"),         # Current network (only valid as source)
-    ipaddress.ip_network("10.0.0.0/8"),        # Private network
-    ipaddress.ip_network("100.64.0.0/10"),     # Shared address space / CGNAT
-    ipaddress.ip_network("127.0.0.0/8"),       # Loopback
-    ipaddress.ip_network("169.254.0.0/16"),    # Link-local / Cloud metadata (169.254.169.254)
-    ipaddress.ip_network("172.16.0.0/12"),     # Private network
-    ipaddress.ip_network("192.0.0.0/24"),      # IETF Protocol Assignments
-    ipaddress.ip_network("192.0.2.0/24"),      # Documentation (TEST-NET-1)
-    ipaddress.ip_network("192.88.99.0/24"),    # 6to4 relay
-    ipaddress.ip_network("192.168.0.0/16"),    # Private network
-    ipaddress.ip_network("198.18.0.0/15"),     # Network interconnect benchmark testing
-    ipaddress.ip_network("198.51.100.0/24"),   # Documentation (TEST-NET-2)
-    ipaddress.ip_network("203.0.113.0/24"),    # Documentation (TEST-NET-3)
-    ipaddress.ip_network("224.0.0.0/4"),       # Multicast
-    ipaddress.ip_network("240.0.0.0/4"),       # Reserved for future use
-    ipaddress.ip_network("255.255.255.255/32"),# Broadcast
-    # IPv6 ranges
-    ipaddress.ip_network("::/128"),            # Unspecified
-    ipaddress.ip_network("::1/128"),           # Loopback
-    ipaddress.ip_network("::ffff:0:0/96"),     # IPv4-mapped IPv6
-    ipaddress.ip_network("100::/64"),          # Discard prefix
-    ipaddress.ip_network("2001:db8::/32"),     # Documentation
-    ipaddress.ip_network("fc00::/7"),          # Unique local address (ULA)
-    ipaddress.ip_network("fe80::/10"),         # Link-local
-    ipaddress.ip_network("ff00::/8"),          # Multicast
+# ── Blocked networks (explicit, beyond Python's built-in flags) ───────────────
+
+_BLOCKED_NETS: List[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
+    # IPv4
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),    # CGNAT / shared space
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),   # link-local / cloud metadata
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.0.0.0/24"),
+    ipaddress.ip_network("192.0.2.0/24"),     # TEST-NET-1
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("198.51.100.0/24"),  # TEST-NET-2
+    ipaddress.ip_network("203.0.113.0/24"),   # TEST-NET-3
+    ipaddress.ip_network("224.0.0.0/4"),      # multicast
+    ipaddress.ip_network("240.0.0.0/4"),      # reserved
+    ipaddress.ip_network("255.255.255.255/32"),
+    # IPv6
+    ipaddress.ip_network("::/128"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("100::/64"),         # discard
+    ipaddress.ip_network("2001:db8::/32"),    # documentation
+    ipaddress.ip_network("fc00::/7"),         # ULA
+    ipaddress.ip_network("fe80::/10"),        # link-local
+    ipaddress.ip_network("ff00::/8"),         # multicast
 ]
 
-BLOCKED_HOSTNAMES = {
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+
+_BLOCKED_HOSTS = {
     "localhost",
     "localhost.localdomain",
     "ip6-localhost",
     "ip6-loopback",
-    "instance-data",
+    "broadcasthost",
     "metadata.google.internal",
+    "instance-data",
+    "169.254.169.254",
 }
 
 
-def is_ip_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """Check if an IP address belongs to any blocked or private/reserved range."""
-    # Built-in standard checks
-    if (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    ):
+# ── Core helpers ──────────────────────────────────────────────────────────────
+
+def _is_ip_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True if the IP must be blocked (private / internal / reserved)."""
+    # Unwrap IPv4-mapped and NAT64 to validate the embedded IPv4 address.
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped:
+            return _is_ip_blocked(ip.ipv4_mapped)
+        if ip in _NAT64_PREFIX:
+            return _is_ip_blocked(ipaddress.IPv4Address(ip.packed[-4:]))
+
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
         return True
-
-    # Check against explicit blocked networks (e.g., metadata, CGNAT)
-    for network in BLOCKED_IP_NETWORKS:
-        if ip in network:
+    if ip.is_reserved and not ip.is_global:
+        return True
+    for net in _BLOCKED_NETS:
+        if ip in net:
             return True
-
     return False
 
 
 def validate_and_sanitize_url(url: str, resolve_dns: bool = True) -> Tuple[str, List[str]]:
     """
-    Validate URL structure and enforce comprehensive SSRF protection.
-    
+    Validate *url* and optionally resolve its hostname.
+
     Returns:
-        Tuple of (clean_normalized_url, list_of_resolved_ip_addresses)
-        
+        (clean_url, resolved_ip_strings)
+
     Raises:
-        URLValidationError: For syntax, unsupported schemes, or missing hosts.
-        SSRFValidationError: For blocked IP addresses, loopback, or cloud metadata.
+        URLValidationError  – bad syntax / unsupported scheme / missing host
+        SSRFValidationError – blocked IP / internal hostname
     """
     if not url or not isinstance(url, str):
-        raise URLValidationError("URL parameter must be a non-empty string.")
-
-    url_clean = url.strip()
-    if not url_clean:
+        raise URLValidationError("URL must be a non-empty string.")
+    url = url.strip()
+    if not url:
         raise URLValidationError("URL cannot be empty.")
 
     try:
-        parsed = urlsplit(url_clean)
+        parsed = urlsplit(url)
     except Exception as exc:
-        raise URLValidationError(f"Invalid URL format: {exc}")
+        raise URLValidationError(f"Malformed URL: {exc}") from exc
 
-    # Validate scheme
     scheme = parsed.scheme.lower()
     if scheme not in ("http", "https"):
         raise URLValidationError(
-            f"Unsupported scheme '{scheme}'. Only 'http' and 'https' are allowed."
+            f"Unsupported scheme '{scheme}'. Only http and https are allowed."
         )
 
-    # Validate hostname presence
     hostname = parsed.hostname
     if not hostname:
         raise URLValidationError("URL is missing a valid hostname.")
 
-    hostname_lower = hostname.lower()
+    hn = hostname.lower()
 
-    # Block well-known internal hostnames and suffix patterns
-    if hostname_lower in BLOCKED_HOSTNAMES:
-        raise SSRFValidationError(
-            f"SSRF Protection: Access to internal host '{hostname}' is blocked."
-        )
+    # Hostname blocklist
+    if hn in _BLOCKED_HOSTS:
+        raise SSRFValidationError(f"SSRF Protection: host '{hostname}' is blocked.")
+    if hn.endswith(".localhost") or hn.endswith(".local") or hn.endswith(".internal"):
+        raise SSRFValidationError(f"SSRF Protection: domain '{hostname}' is blocked.")
 
-    if (
-        hostname_lower.endswith(".localhost")
-        or hostname_lower.endswith(".local")
-        or hostname_lower.endswith(".internal")
-    ):
-        raise SSRFValidationError(
-            f"SSRF Protection: Access to internal domain '{hostname}' is blocked."
-        )
-
-    # Check if host is a direct IP literal
-    direct_ip = None
+    # Direct IP literal check
     try:
-        direct_ip = ipaddress.ip_address(hostname_lower)
-    except (ValueError, TypeError):
-        pass
-
-    if direct_ip is not None:
-        if is_ip_blocked(direct_ip):
+        direct_ip = ipaddress.ip_address(hn)
+        if _is_ip_blocked(direct_ip):
             raise SSRFValidationError(
-                f"SSRF Protection: Access to IP address '{direct_ip}' is blocked."
+                f"SSRF Protection: IP address '{direct_ip}' is blocked."
             )
-        return url_clean, [str(direct_ip)]
+        return url, [str(direct_ip)]
+    except ValueError:
+        pass  # not a literal IP — proceed to DNS
 
     if not resolve_dns:
-        return url_clean, []
+        return url, []
 
-    # Resolve DNS to catch DNS rebinding or domains mapping to private/internal IPs
-    resolved_ips: List[str] = []
+    # DNS resolution — check every returned address
     try:
-        # Use port from URL or default for scheme
         port = parsed.port or (443 if scheme == "https" else 80)
-        addr_info = socket.getaddrinfo(hostname_lower, port, proto=socket.IPPROTO_TCP)
-        
-        for entry in addr_info:
-            sockaddr = entry[4]
-            ip_str = sockaddr[0]
-            resolved_ips.append(ip_str)
-            try:
-                ip_obj = ipaddress.ip_address(ip_str)
-                if is_ip_blocked(ip_obj):
-                    raise SSRFValidationError(
-                        f"SSRF Protection: Domain '{hostname}' resolves to blocked IP address '{ip_str}'."
-                    )
-            except ValueError:
-                continue
+        addr_infos = socket.getaddrinfo(hn, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise URLValidationError(f"Cannot resolve '{hostname}': {exc.strerror}") from exc
 
-    except socket.gaierror as e:
-        raise URLValidationError(f"Unable to resolve domain '{hostname}': {e.strerror}")
-    except socket.herror as e:
-        raise URLValidationError(f"Host error resolving '{hostname}': {e.strerror}")
-    except SSRFValidationError:
-        raise
-    except Exception as e:
-        raise URLValidationError(f"Failed to resolve host '{hostname}': {e}")
+    resolved: List[str] = []
+    for entry in addr_infos:
+        ip_str = entry[4][0]
+        resolved.append(ip_str)
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+            if _is_ip_blocked(ip_obj):
+                raise SSRFValidationError(
+                    f"SSRF Protection: '{hostname}' resolves to blocked IP '{ip_str}'."
+                )
+        except ValueError:
+            continue
 
-    if not resolved_ips:
-        raise URLValidationError(f"No IP addresses could be resolved for '{hostname}'.")
+    if not resolved:
+        raise URLValidationError(f"No IP addresses resolved for '{hostname}'.")
 
-    return url_clean, resolved_ips
+    return url, resolved

@@ -1,1 +1,1 @@
-"""Utility modules including validators and helpers."""
+"""Utils package."""

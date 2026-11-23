@@ -130,7 +130,7 @@ class TestHTMLExtraction:
         </html>
         """
 
-        extracted = extractor._clean_and_extract_html(sample_html, "https://acme.ai", "https://acme.ai")
+        extracted = extractor._parse(sample_html, "https://acme.ai", "https://acme.ai")
 
         assert extracted.title == "Acme AI - Next Gen Automation"
         assert extracted.meta_description == "Acme AI automates customer support with LLMs."
